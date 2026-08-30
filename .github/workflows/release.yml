@@ -1,0 +1,216 @@
+name: Central production release
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: Application identifier assigned by the private release policy
+        required: true
+        type: string
+      source_sha:
+        description: Exact successful CI commit
+        required: true
+        type: string
+      ci_run_id:
+        description: GitHub Actions workflow run that triggered the caller
+        required: true
+        type: number
+    outputs:
+      source_sha:
+        description: Released source commit
+        value: ${{ jobs.release.outputs.source_sha }}
+      release_reference:
+        description: Immutable release marker reference
+        value: ${{ jobs.release.outputs.release_reference }}
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+concurrency:
+  group: production-${{ inputs.app }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release ${{ inputs.app }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      source_sha: ${{ steps.plan.outputs.sha }}
+      release_reference: ${{ steps.marker.outputs.release_reference }}
+    steps:
+      - name: Check out the exact release gateway
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: gateway
+          persist-credentials: false
+
+      - name: Verify reusable workflow identity and immutable reference
+        shell: bash
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_FILE: ${{ job.workflow_file_path }}
+          WORKFLOW_REF: ${{ job.workflow_ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "mahmoudelfeelig/HetznerReleaseGateway"
+          test "$WORKFLOW_FILE" = ".github/workflows/release.yml"
+          test "$WORKFLOW_REF" = "$WORKFLOW_REPOSITORY/$WORKFLOW_FILE@$WORKFLOW_SHA"
+          test "$(git -C gateway rev-parse HEAD)" = "$WORKFLOW_SHA"
+
+      - name: Check out the exact application source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.source_sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Authorize the exact CI release
+        id: plan
+        shell: bash
+        env:
+          APP_INPUT: ${{ inputs.app }}
+          CI_RUN_ID_INPUT: ${{ inputs.ci_run_id }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_SHA_INPUT: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          python gateway/scripts/release_plan.py \
+            --app "$APP_INPUT" \
+            --source-root source \
+            --event "$GITHUB_EVENT_PATH" \
+            --source-sha "$SOURCE_SHA_INPUT" \
+            --run-id "$CI_RUN_ID_INPUT" \
+            --wait-required-seconds 900 \
+            --plan-output "$RUNNER_TEMP/release-plan.json"
+
+      - name: Download CI image artifact
+        if: steps.plan.outputs.strategy == 'artifact-images'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python gateway/scripts/download_artifact.py \
+            --plan "$RUNNER_TEMP/release-plan.json" \
+            --output-directory "$RUNNER_TEMP/release-artifact"
+
+      - name: Publish immutable application images
+        shell: bash
+        run: |
+          set -euo pipefail
+          python gateway/scripts/publish_images.py \
+            --plan "$RUNNER_TEMP/release-plan.json" \
+            --source-root source \
+            --artifact-root "$RUNNER_TEMP/release-artifact" \
+            --output "$RUNNER_TEMP/image-digests.json"
+
+      - name: Revalidate release authority before marker creation
+        shell: bash
+        env:
+          APP_INPUT: ${{ inputs.app }}
+          CI_RUN_ID_INPUT: ${{ inputs.ci_run_id }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_SHA_INPUT: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          python gateway/scripts/release_plan.py \
+            --app "$APP_INPUT" \
+            --source-root source \
+            --event "$GITHUB_EVENT_PATH" \
+            --source-sha "$SOURCE_SHA_INPUT" \
+            --run-id "$CI_RUN_ID_INPUT" \
+            --plan-output "$RUNNER_TEMP/revalidated-plan.json"
+          cmp "$RUNNER_TEMP/release-plan.json" "$RUNNER_TEMP/revalidated-plan.json"
+
+      - name: Create schema-v2 release marker
+        shell: bash
+        env:
+          GATEWAY_REPOSITORY: ${{ job.workflow_repository }}
+          GATEWAY_SHA: ${{ job.workflow_sha }}
+          GATEWAY_WORKFLOW_PATH: ${{ job.workflow_file_path }}
+        run: |
+          set -euo pipefail
+          python gateway/scripts/make_release_marker.py \
+            --plan "$RUNNER_TEMP/release-plan.json" \
+            --digests "$RUNNER_TEMP/image-digests.json" \
+            --gateway-repository "$GATEWAY_REPOSITORY" \
+            --gateway-workflow-path "$GATEWAY_WORKFLOW_PATH" \
+            --gateway-sha "$GATEWAY_SHA" \
+            --output-directory "$RUNNER_TEMP/release-marker"
+
+      - name: Promote release marker
+        id: marker
+        shell: bash
+        env:
+          APP_INPUT: ${{ inputs.app }}
+          CI_RUN_ID_INPUT: ${{ inputs.ci_run_id }}
+          GITHUB_TOKEN: ${{ github.token }}
+          REGISTRY_HOST: ${{ steps.plan.outputs.registry_host }}
+          RELEASE_REPOSITORY: ${{ steps.plan.outputs.release_repository }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          oidc_token="$(python gateway/scripts/request_oidc.py --audience "https://$REGISTRY_HOST")"
+          echo "::add-mask::$oidc_token"
+          printf '%s' "$oidc_token" | docker login "$REGISTRY_HOST" \
+            --username github-actions --password-stdin
+          label="$(cat "$RUNNER_TEMP/release-marker/label.txt")"
+          immutable="$REGISTRY_HOST/$RELEASE_REPOSITORY:$SOURCE_SHA"
+          production="$REGISTRY_HOST/$RELEASE_REPOSITORY:production"
+          docker build \
+            --label "org.elfeel.release=$label" \
+            --label "org.opencontainers.image.revision=$SOURCE_SHA" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --tag "$immutable" \
+            "$RUNNER_TEMP/release-marker"
+          docker push "$immutable"
+          docker pull "$immutable"
+          digest="$(docker image inspect "$immutable" --format '{{json .RepoDigests}}' | \
+            python -c 'import json,sys; p=sys.argv[1]+"@sha256:"; v=[x for x in json.load(sys.stdin) if x.startswith(p)]; print(v[0]) if len(v)==1 else sys.exit(1)' "$REGISTRY_HOST/$RELEASE_REPOSITORY")"
+          case "$digest" in
+            "$REGISTRY_HOST/$RELEASE_REPOSITORY@sha256:"*) ;;
+            *) echo "Registry returned an invalid release digest" >&2; exit 1 ;;
+          esac
+          python gateway/scripts/release_plan.py \
+            --app "$APP_INPUT" \
+            --source-root source \
+            --event "$GITHUB_EVENT_PATH" \
+            --source-sha "$SOURCE_SHA" \
+            --run-id "$CI_RUN_ID_INPUT" \
+            --plan-output "$RUNNER_TEMP/final-release-plan.json"
+          cmp "$RUNNER_TEMP/release-plan.json" "$RUNNER_TEMP/final-release-plan.json"
+          docker tag "$immutable" "$production"
+          docker push "$production"
+          echo "release_reference=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for signed minimal production receipt
+        shell: bash
+        env:
+          APP_INPUT: ${{ inputs.app }}
+          RELEASE_REFERENCE: ${{ steps.marker.outputs.release_reference }}
+          SOURCE_SHA_INPUT: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          python gateway/scripts/wait_for_receipt.py \
+            --app "$APP_INPUT" \
+            --source-sha "$SOURCE_SHA_INPUT" \
+            --release-reference "$RELEASE_REFERENCE" \
+            --public-key gateway/trust/deployment-receipt.pub \
+            --timeout-seconds 1800
+
+      - name: Remove registry credentials
+        if: always()
+        shell: bash
+        env:
+          REGISTRY_HOST: ${{ steps.plan.outputs.registry_host }}
+        run: |
+          if [ -n "$REGISTRY_HOST" ]; then
+            docker logout "$REGISTRY_HOST" || true
+          fi
