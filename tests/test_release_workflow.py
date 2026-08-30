@@ -7,6 +7,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+WORKFLOW_DIRECTORY = ROOT / ".github" / "workflows"
+CHECKOUT_V6_SHA = "d23441a48e516b6c34aea4fa41551a30e30af803"
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
@@ -21,6 +23,19 @@ class ReleaseWorkflowTests(unittest.TestCase):
             if value.startswith("mahmoudelfeelig/"):
                 continue
             self.assertRegex(value, r"^[^@]+@[0-9a-f]{40}$")
+
+    def test_all_workflows_use_the_audited_checkout_v6_commit(self) -> None:
+        checkout_uses = []
+        for workflow in WORKFLOW_DIRECTORY.glob("*.yml"):
+            text = workflow.read_text(encoding="utf-8")
+            checkout_uses.extend(
+                re.findall(r"^\s*uses:\s*(actions/checkout@[^\s]+)", text, re.MULTILINE)
+            )
+        self.assertGreaterEqual(len(checkout_uses), 3)
+        self.assertEqual(
+            set(checkout_uses),
+            {f"actions/checkout@{CHECKOUT_V6_SHA}"},
+        )
 
     def test_artifact_download_uses_gateway_verifier_not_download_action(self) -> None:
         self.assertNotIn("actions/download-artifact", self.text)
