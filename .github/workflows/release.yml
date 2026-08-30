@@ -42,7 +42,7 @@ jobs:
       release_reference: ${{ steps.marker.outputs.release_reference }}
     steps:
       - name: Check out the exact release gateway
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
@@ -64,7 +64,7 @@ jobs:
           test "$(git -C gateway rev-parse HEAD)" = "$WORKFLOW_SHA"
 
       - name: Check out the exact application source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: ${{ github.repository }}
           ref: ${{ inputs.source_sha }}
