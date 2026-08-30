@@ -42,6 +42,7 @@ MAX_BLOB_SIZE = 1 << 40
 MAX_LAYERS = 4096
 MAX_ATTEMPTS = 4
 HTTP_TIMEOUT_SECONDS = 30
+USER_AGENT = "elfeel-release-gateway/1.0"
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _REPOSITORY_COMPONENT = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*\Z")
@@ -643,6 +644,26 @@ class _RegistryClient:
         )
         self._bearer_token: str | None = None
 
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        body: bytes | None = None,
+    ) -> urllib.request.Request:
+        if _origin(url) != _origin(self.base_url):
+            raise RegistryUploadError("refusing to send a registry request across origins")
+        request_headers = {
+            name: value
+            for name, value in (headers or {}).items()
+            if name.lower() != "user-agent"
+        }
+        request_headers["User-Agent"] = USER_AGENT
+        if body is not None:
+            request_headers["Content-Length"] = str(len(body))
+        return urllib.request.Request(url, data=body, headers=request_headers, method=method)
+
     def _send(
         self,
         method: str,
@@ -651,12 +672,7 @@ class _RegistryClient:
         headers: Mapping[str, str] | None = None,
         body: bytes | None = None,
     ) -> _Response:
-        if _origin(url) != _origin(self.base_url):
-            raise RegistryUploadError("refusing to send a registry request across origins")
-        request_headers = dict(headers or {})
-        if body is not None:
-            request_headers["Content-Length"] = str(len(body))
-        request = urllib.request.Request(url, data=body, headers=request_headers, method=method)
+        request = self._request(method, url, headers=headers, body=body)
         try:
             response = self._opener.open(request, timeout=HTTP_TIMEOUT_SECONDS)
         except urllib.error.HTTPError as error:
@@ -736,7 +752,6 @@ class _RegistryClient:
                     headers={
                         "Authorization": f"Basic {basic}",
                         "Accept": "application/json",
-                        "User-Agent": "elfeel-release-gateway",
                     },
                 )
             except _TransportError:
@@ -849,10 +864,10 @@ class _RegistryClient:
         url = self._repository_url(f"blobs/{descriptor.digest}")
         last_transport_error: _TransportError | None = None
         for attempt in range(MAX_ATTEMPTS):
-            request = urllib.request.Request(
+            request = self._request(
+                "GET",
                 url,
                 headers=self._authorization(),
-                method="GET",
             )
             try:
                 response = self._opener.open(request, timeout=HTTP_TIMEOUT_SECONDS)
