@@ -12,7 +12,12 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from registry_upload import publish_oci_layout
+from registry_upload import (
+    OCI_MANIFEST_MEDIA_TYPE,
+    load_oci_layout,
+    publish_oci_layout,
+    resolve_existing_oci_image,
+)
 
 
 CHECKSUM_ENTRY = re.compile(r"^([0-9a-fA-F]{64}) [ *](.+)$")
@@ -20,6 +25,97 @@ SKOPEO_VERSION = re.compile(
     r"^skopeo version ([0-9]+)\.([0-9]+)\.([0-9]+)(?:[-+][A-Za-z0-9.-]+)?$"
 )
 AUDITED_SKOPEO_VERSION = (1, 13, 3)
+SOURCE_SHA = re.compile(r"^[0-9a-f]{40}$")
+PROVENANCE_PREFIX = "io.elfeel.release."
+
+
+def canonical_plan_digest(plan: dict[str, Any]) -> str:
+    payload = json.dumps(
+        plan,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def component_provenance(
+    plan: dict[str, Any],
+    component: dict[str, Any],
+    gateway_sha: str,
+) -> dict[str, str]:
+    if SOURCE_SHA.fullmatch(gateway_sha) is None:
+        raise RuntimeError("gateway SHA is invalid")
+    return {
+        "io.elfeel.release.provenance-version": "1",
+        "io.elfeel.release.plan-digest": canonical_plan_digest(plan),
+        "io.elfeel.release.app": plan["app"],
+        "io.elfeel.release.component": component["name"],
+        "io.elfeel.release.strategy": plan["strategy"],
+        "io.elfeel.release.gateway-sha": gateway_sha,
+        "org.opencontainers.image.source": f"https://github.com/{plan['repository']}",
+        "org.opencontainers.image.revision": plan["sha"],
+    }
+
+
+def stamp_oci_layout(layout: Path, annotations: dict[str, str]) -> None:
+    loaded = load_oci_layout(layout)
+    manifest = json.loads(loaded.manifest_bytes)
+    existing = manifest.get("annotations") or {}
+    if not isinstance(existing, dict):
+        raise RuntimeError("OCI image manifest annotations are invalid")
+    unexpected_reserved = {
+        key
+        for key in existing
+        if key.startswith(PROVENANCE_PREFIX) and key not in annotations
+    }
+    if unexpected_reserved:
+        raise RuntimeError("OCI image manifest contains reserved provenance annotations")
+    manifest["mediaType"] = OCI_MANIFEST_MEDIA_TYPE
+    manifest["annotations"] = {**existing, **annotations}
+    manifest_bytes = json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    encoded = hashlib.sha256(manifest_bytes).hexdigest()
+    digest = f"sha256:{encoded}"
+    manifest_path = loaded.root / "blobs" / "sha256" / encoded
+    if manifest_path.is_symlink() or (
+        manifest_path.exists() and not manifest_path.is_file()
+    ):
+        raise RuntimeError("OCI manifest digest path is not a regular file")
+    if manifest_path.exists() and manifest_path.read_bytes() != manifest_bytes:
+        raise RuntimeError("OCI manifest digest path contains different bytes")
+    manifest_path.write_bytes(manifest_bytes)
+
+    index_path = loaded.root / "index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    descriptor = index["manifests"][0]
+    descriptor["digest"] = digest
+    descriptor["size"] = len(manifest_bytes)
+    temporary = loaded.root / "index.json.new"
+    if temporary.exists() or temporary.is_symlink():
+        raise RuntimeError("temporary OCI index path already exists")
+    temporary.write_text(
+        json.dumps(
+            index,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    os.replace(temporary, index_path)
+    stamped = load_oci_layout(loaded.root)
+    stamped_manifest = json.loads(stamped.manifest_bytes)
+    if stamped.manifest.digest != digest or any(
+        stamped_manifest["annotations"].get(key) != value
+        for key, value in annotations.items()
+    ):
+        raise RuntimeError("OCI provenance stamping did not persist exact annotations")
 
 
 def run(command: list[str], description: str, *, cwd: Path | None = None) -> None:
@@ -44,7 +140,12 @@ def verify_skopeo() -> tuple[int, int, int]:
     return version
 
 
-def publish_local_image(image: str, host: str, description: str) -> str:
+def publish_local_image(
+    image: str,
+    host: str,
+    description: str,
+    annotations: dict[str, str],
+) -> str:
     temporary_root = os.environ.get("RUNNER_TEMP")
     with tempfile.TemporaryDirectory(
         prefix="elfeel-oci-layout-", dir=temporary_root
@@ -61,6 +162,7 @@ def publish_local_image(image: str, host: str, description: str) -> str:
             ],
             f"Preparing an OCI layout for {description.casefold()}",
         )
+        stamp_oci_layout(layout, annotations)
         print(description, flush=True)
         return publish_oci_layout(layout, image, host)
 
@@ -92,9 +194,23 @@ def checksum_for_archive(root: Path, archive: Path, checksums: Path) -> str:
     return actual
 
 
-def publish_source_build(plan: dict[str, Any], source_root: Path) -> dict[str, str]:
+def publish_source_build(
+    plan: dict[str, Any],
+    source_root: Path,
+    gateway_sha: str,
+) -> dict[str, str]:
     result: dict[str, str] = {}
     for component in plan["components"]:
+        annotations = component_provenance(plan, component, gateway_sha)
+        existing = resolve_existing_oci_image(
+            component["destination"],
+            plan["registry"]["host"],
+            annotations,
+        )
+        if existing is not None:
+            print(f"Reusing verified component {component['name']}", flush=True)
+            result[component["name"]] = existing
+            continue
         dockerfile = _safe_source_path(source_root, component["dockerfile"])
         context = _safe_source_path(source_root, component["context"])
         if not dockerfile.is_file():
@@ -123,18 +239,40 @@ def publish_source_build(plan: dict[str, Any], source_root: Path) -> dict[str, s
             component["destination"],
             plan["registry"]["host"],
             f"Publishing component {component['name']}",
+            annotations,
         )
     return result
 
 
 def publish_artifact_images(
-    plan: dict[str, Any], artifact_root: Path, archive: str, checksums: str
+    plan: dict[str, Any],
+    artifact_root: Path,
+    archive: str,
+    checksums: str,
+    gateway_sha: str,
 ) -> dict[str, str]:
     archive_path = _safe_source_path(artifact_root, archive)
     checksums_path = _safe_source_path(artifact_root, checksums)
     if not archive_path.is_file() or not checksums_path.is_file():
         raise RuntimeError("release artifact is missing its image archive or checksum manifest")
     checksum_for_archive(artifact_root, archive_path, checksums_path)
+    result: dict[str, str] = {}
+    missing: list[tuple[dict[str, Any], dict[str, str]]] = []
+    for component in plan["components"]:
+        annotations = component_provenance(plan, component, gateway_sha)
+        existing = resolve_existing_oci_image(
+            component["destination"],
+            plan["registry"]["host"],
+            annotations,
+        )
+        if existing is None:
+            missing.append((component, annotations))
+        else:
+            print(f"Reusing verified component {component['name']}", flush=True)
+            result[component["name"]] = existing
+
+    if not missing:
+        return result
     if archive_path.name.endswith(".tar.gz"):
         run(
             [
@@ -154,8 +292,7 @@ def publish_artifact_images(
             "Loading the verified image archive",
         )
 
-    result: dict[str, str] = {}
-    for component in plan["components"]:
+    for component, annotations in missing:
         run(
             ["docker", "image", "inspect", component["artifact_image"]],
             f"Inspecting component {component['name']}",
@@ -168,6 +305,7 @@ def publish_artifact_images(
             component["destination"],
             plan["registry"]["host"],
             f"Publishing component {component['name']}",
+            annotations,
         )
     return result
 
@@ -177,13 +315,18 @@ def main() -> int:
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--artifact-root", type=Path)
+    parser.add_argument("--gateway-sha", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
     verify_skopeo()
     if plan["strategy"] == "source-build":
-        digests = publish_source_build(plan, args.source_root.resolve())
+        digests = publish_source_build(
+            plan,
+            args.source_root.resolve(),
+            args.gateway_sha,
+        )
     elif plan["strategy"] == "artifact-images":
         if args.artifact_root is None:
             parser.error("--artifact-root is required for artifact-images")
@@ -192,6 +335,7 @@ def main() -> int:
             args.artifact_root.resolve(),
             plan["artifact"]["archive"],
             plan["artifact"]["checksums"],
+            args.gateway_sha,
         )
     else:
         raise RuntimeError("release plan has an unsupported strategy")

@@ -368,6 +368,13 @@ def build_plan(
     registry = config["registry"]
     release = config["release"]
     strategy = release["strategy"]
+    if not selected_runs:
+        raise ValueError("release plan requires successful CI evidence")
+    completed = [
+        github_timestamp(run.get("updated_at"), f"{name} completion")
+        for name, run in selected_runs.items()
+    ]
+    published_at = max(completed).isoformat().replace("+00:00", "Z")
     components: list[dict[str, Any]] = []
     for component in release["components"]:
         item: dict[str, Any] = {
@@ -411,6 +418,7 @@ def build_plan(
         "app": config["id"],
         "repository": config["source"]["repository"],
         "sha": source_sha,
+        "published_at": published_at,
         "strategy": strategy,
         "registry": registry,
         "components": components,

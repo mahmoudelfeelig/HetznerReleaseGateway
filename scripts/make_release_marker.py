@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import io
 import json
 import re
-from datetime import UTC, datetime
+import tarfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +23,10 @@ DIGEST_REFERENCE = re.compile(
 )
 ARTIFACT_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 MAX_ARTIFACT_BYTES = 5 * 1024 * 1024 * 1024
+OCI_LAYOUT_MEDIA_TYPE = "application/vnd.oci.image.index.v1+json"
+OCI_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
+OCI_CONFIG_MEDIA_TYPE = "application/vnd.oci.image.config.v1+json"
+OCI_LAYER_MEDIA_TYPE = "application/vnd.oci.image.layer.v1.tar"
 
 
 def _artifact_provenance(
@@ -83,7 +90,6 @@ def make_release(
     plan: dict[str, Any],
     digests: dict[str, str],
     gateway: dict[str, str],
-    published_at: str,
 ) -> dict[str, Any]:
     app = plan.get("app")
     repository = plan.get("repository")
@@ -106,6 +112,7 @@ def make_release(
         raise ValueError("gateway workflow path is invalid")
     if not isinstance(gateway["sha"], str) or not SHA.fullmatch(gateway["sha"]):
         raise ValueError("gateway SHA is invalid")
+    published_at = plan.get("published_at")
     if not isinstance(published_at, str):
         raise ValueError("publication timestamp is invalid")
     try:
@@ -162,6 +169,111 @@ def compact_label(release: dict[str, Any]) -> str:
     return base64.urlsafe_b64encode(serialized).decode("ascii").rstrip("=")
 
 
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _write_blob(root: Path, value: bytes, media_type: str) -> dict[str, Any]:
+    encoded = hashlib.sha256(value).hexdigest()
+    digest = f"sha256:{encoded}"
+    path = root / "blobs" / "sha256" / encoded
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(value)
+    return {"mediaType": media_type, "digest": digest, "size": len(value)}
+
+
+def _release_layer(release: dict[str, Any]) -> tuple[bytes, bytes]:
+    release_json = (
+        json.dumps(release, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    timestamp = int(
+        datetime.fromisoformat(
+            release["published_at"].replace("Z", "+00:00")
+        ).timestamp()
+    )
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        member = tarfile.TarInfo("release.json")
+        member.size = len(release_json)
+        member.mode = 0o444
+        member.uid = 0
+        member.gid = 0
+        member.uname = ""
+        member.gname = ""
+        member.mtime = timestamp
+        archive.addfile(member, io.BytesIO(release_json))
+    return output.getvalue(), release_json
+
+
+def write_oci_layout(release: dict[str, Any], output_directory: Path) -> str:
+    """Write one deterministic, single-platform OCI release-marker image."""
+
+    root = Path(output_directory)
+    if root.exists() or root.is_symlink():
+        raise ValueError("release marker OCI output already exists")
+    root.mkdir(mode=0o700)
+
+    layer_bytes, _ = _release_layer(release)
+    layer = _write_blob(root, layer_bytes, OCI_LAYER_MEDIA_TYPE)
+    config_bytes = _canonical_json(
+        {
+            "architecture": "amd64",
+            "os": "linux",
+            "created": release["published_at"],
+            "config": {
+                "Labels": {
+                    "org.elfeel.release": compact_label(release),
+                    "org.opencontainers.image.revision": release["source_sha"],
+                    "org.opencontainers.image.source": (
+                        f"https://github.com/{release['repository']}"
+                    ),
+                }
+            },
+            "rootfs": {"type": "layers", "diff_ids": [layer["digest"]]},
+            "history": [
+                {
+                    "created": release["published_at"],
+                    "created_by": "elfeel release gateway",
+                    "comment": "deterministic schema-v2 release marker",
+                }
+            ],
+        }
+    )
+    config = _write_blob(root, config_bytes, OCI_CONFIG_MEDIA_TYPE)
+    manifest_bytes = _canonical_json(
+        {
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+            "config": config,
+            "layers": [layer],
+            "annotations": {
+                "org.opencontainers.image.created": release["published_at"],
+                "org.opencontainers.image.revision": release["source_sha"],
+                "org.opencontainers.image.source": (
+                    f"https://github.com/{release['repository']}"
+                ),
+            },
+        }
+    )
+    manifest = _write_blob(root, manifest_bytes, OCI_MANIFEST_MEDIA_TYPE)
+    manifest["platform"] = {"architecture": "amd64", "os": "linux"}
+    manifest["annotations"] = {"org.opencontainers.image.ref.name": "release"}
+
+    (root / "oci-layout").write_bytes(
+        _canonical_json({"imageLayoutVersion": "1.0.0"})
+    )
+    (root / "index.json").write_bytes(
+        _canonical_json(
+            {
+                "schemaVersion": 2,
+                "mediaType": OCI_LAYOUT_MEDIA_TYPE,
+                "manifests": [manifest],
+            }
+        )
+    )
+    return manifest["digest"]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create a schema-v2 OCI release marker")
     parser.add_argument("--plan", type=Path, required=True)
@@ -174,7 +286,6 @@ def main() -> int:
 
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
     digests = json.loads(args.digests.read_text(encoding="utf-8"))
-    published_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     release = make_release(
         plan,
         digests,
@@ -183,19 +294,12 @@ def main() -> int:
             "workflow_path": args.gateway_workflow_path,
             "sha": args.gateway_sha,
         },
-        published_at,
     )
-    args.output_directory.mkdir(parents=True, exist_ok=True)
-    (args.output_directory / "release.json").write_text(
-        json.dumps(release, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    digest = write_oci_layout(release, args.output_directory)
+    print(
+        f"created deterministic schema-v2 OCI release marker {digest} "
+        f"for {release['app']} at {release['source_sha']}"
     )
-    (args.output_directory / "Dockerfile").write_text(
-        "FROM scratch\nCOPY release.json /release.json\n", encoding="utf-8"
-    )
-    (args.output_directory / "label.txt").write_text(
-        compact_label(release), encoding="ascii"
-    )
-    print(f"created schema-v2 release marker for {release['app']} at {release['source_sha']}")
     return 0
 
 

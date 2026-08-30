@@ -73,8 +73,52 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
     def test_marker_receipt_and_revalidation_are_present(self) -> None:
         self.assertIn("make_release_marker.py", self.text)
+        self.assertIn("publish_release_marker.py publish", self.text)
+        self.assertIn("publish_release_marker.py promote", self.text)
         self.assertIn("wait_for_receipt.py", self.text)
         self.assertEqual(self.text.count("release_plan.py"), 3)
+
+    def test_component_publication_is_bound_to_exact_gateway_sha(self) -> None:
+        step_start = self.text.index("- name: Publish immutable application images")
+        step_end = self.text.index("\n      - name:", step_start + 1)
+        step = self.text[step_start:step_end]
+        self.assertIn("GATEWAY_SHA: ${{ job.workflow_sha }}", step)
+        self.assertIn('--gateway-sha "$GATEWAY_SHA"', step)
+
+    def test_marker_uses_in_memory_oidc_client_without_docker_credentials(self) -> None:
+        for command in (
+            "docker build",
+            "docker login",
+            "docker push",
+            "docker pull",
+            "docker tag",
+            "docker logout",
+        ):
+            with self.subTest(command=command):
+                self.assertNotIn(command, self.text)
+        self.assertNotIn("password-stdin", self.text)
+
+    def test_final_revalidation_is_adjacent_to_production_promotion(self) -> None:
+        final_step = self.text.index(
+            "- name: Revalidate and promote verified OCI release marker"
+        )
+        final_plan = self.text.index(
+            '--plan-output "$RUNNER_TEMP/final-release-plan.json"',
+            final_step,
+        )
+        comparison = self.text.index(
+            'cmp "$RUNNER_TEMP/release-plan.json" '
+            '"$RUNNER_TEMP/final-release-plan.json"',
+            final_plan,
+        )
+        promotion = self.text.index(
+            "publish_release_marker.py promote",
+            comparison,
+        )
+        next_step = self.text.index("\n      - name:", final_step + 1)
+        self.assertLess(final_plan, comparison)
+        self.assertLess(comparison, promotion)
+        self.assertLess(promotion, next_step)
 
 
 if __name__ == "__main__":
