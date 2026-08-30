@@ -4,6 +4,8 @@ This repository is the deliberately small public half of an image-release system
 provides an exact successful source commit, and the gateway independently verifies the triggering
 GitHub Actions run and every workflow required by that commit's release manifest. It then publishes
 immutable component images and a schema-v2 release marker using a short-lived GitHub OIDC identity.
+Component images are normalized into a local OCI layout, then uploaded through the registry's
+resumable API in bounded chunks so an interrupted request resumes without restarting a large layer.
 
 The gateway does not contain an application inventory or any runtime orchestration policy. The
 private controller independently decides whether a marker is authorized and how its named image
