@@ -293,6 +293,33 @@ class AuthenticationTests(unittest.TestCase):
             opener=opener,
         )
 
+    def test_registry_identity_cannot_be_overridden_by_header_casing(self) -> None:
+        client = self._client(_FakeOpener([]), mock.Mock())
+        expected_identity = "elfeel-release-gateway/1.0"
+        self.assertEqual(registry_upload.USER_AGENT, expected_identity)
+        header_sets = [
+            {header_name: "Python-urllib/3.13"}
+            for header_name in ("User-Agent", "user-agent", "USER-AGENT", "User-agent")
+        ]
+        header_sets.append(
+            {
+                "User-Agent": "caller-first",
+                "user-agent": "caller-last",
+                "USER-AGENT": "caller-duplicate",
+            }
+        )
+        for headers in header_sets:
+            with self.subTest(headers=headers):
+                request = client._request(
+                    "GET",
+                    f"https://{HOST}/v2/",
+                    headers=headers,
+                )
+                self.assertEqual(
+                    request.get_header("User-agent"),
+                    expected_identity,
+                )
+
     def test_oidc_is_sent_only_to_same_origin_challenge_realm(self) -> None:
         challenge_headers = _headers(
             WWW_Authenticate=(
@@ -329,6 +356,8 @@ class AuthenticationTests(unittest.TestCase):
         provider.assert_called_once_with(f"https://{HOST}")
         first, second = opener.requests
         self.assertIsNone(first.get_header("Authorization"))
+        self.assertEqual(first.get_header("User-agent"), registry_upload.USER_AGENT)
+        self.assertEqual(second.get_header("User-agent"), registry_upload.USER_AGENT)
         authorization = second.get_header("Authorization")
         self.assertTrue(authorization.startswith("Basic "))
         self.assertNotIn("github.header.payload", authorization)
@@ -776,6 +805,10 @@ class ChunkedUploadTests(unittest.TestCase):
         client._get_blob(descriptor)
         self.assertTrue(response.closed)
         self.assertEqual(len(opener.requests), 1)
+        self.assertEqual(
+            opener.requests[0].get_header("User-agent"),
+            registry_upload.USER_AGENT,
+        )
 
     def test_manifest_put_retries_conditionally_and_verifies_result(self) -> None:
         manifest_bytes = b'{"schemaVersion":2}'
