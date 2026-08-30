@@ -35,7 +35,7 @@ concurrency:
 jobs:
   release:
     name: Release ${{ inputs.app }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     outputs:
       source_sha: ${{ steps.plan.outputs.sha }}

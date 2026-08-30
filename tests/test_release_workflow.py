@@ -49,6 +49,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("group: production-${{ inputs.app }}", self.text)
         self.assertIn("cancel-in-progress: false", self.text)
 
+    def test_release_runner_provides_audited_skopeo_interface(self) -> None:
+        self.assertIn("runs-on: ubuntu-24.04", self.text)
+        publisher = (ROOT / "scripts" / "publish_images.py").read_text(encoding="utf-8")
+        self.assertIn("AUDITED_SKOPEO_VERSION = (1, 13, 3)", publisher)
+
     def test_source_manifest_path_is_fixed_by_gateway_code(self) -> None:
         self.assertIn("--source-root source", self.text)
         self.assertNotIn("--manifest", self.text)

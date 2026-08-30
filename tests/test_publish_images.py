@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import io
-import json
 import sys
 import tempfile
 import unittest
@@ -16,8 +15,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from publish_images import (  # noqa: E402
     checksum_for_archive,
-    inspect_digest,
+    publish_local_image,
     publish_source_build,
+    verify_skopeo,
 )
 
 from helpers import SOURCE_SHA  # noqa: E402
@@ -48,28 +48,47 @@ class PublishImagesTests(unittest.TestCase):
                 checksum_for_archive(root, archive, checksums)
 
     @mock.patch("publish_images.subprocess.run")
-    def test_digest_selection_requires_one_exact_repository(self, run: mock.Mock) -> None:
-        run.return_value.stdout = json.dumps(
-            ["registry.elfeel.me/apps/example-app/web@sha256:" + "a" * 64]
-        )
-        value = inspect_digest(
-            f"registry.elfeel.me/apps/example-app/web:{SOURCE_SHA}"
-        )
-        self.assertEqual(
-            value,
-            "registry.elfeel.me/apps/example-app/web@sha256:" + "a" * 64,
-        )
+    def test_skopeo_version_is_fail_closed(self, run: mock.Mock) -> None:
+        run.return_value.stdout = "skopeo version 1.13.3\n"
+        self.assertEqual(verify_skopeo(), (1, 13, 3))
+        run.return_value.stdout = "skopeo version 1.12.9\n"
+        with self.assertRaisesRegex(RuntimeError, "audited Skopeo"):
+            verify_skopeo()
+        run.return_value.stdout = "skopeo version 1.14.0\n"
+        with self.assertRaisesRegex(RuntimeError, "audited Skopeo"):
+            verify_skopeo()
 
-    @mock.patch("publish_images.inspect_digest")
-    @mock.patch("publish_images.registry_login")
+    @mock.patch("publish_images.publish_oci_layout")
+    @mock.patch("publish_images.run")
+    def test_local_image_is_converted_then_uploaded_in_bounded_chunks(
+        self,
+        run: mock.Mock,
+        publish: mock.Mock,
+    ) -> None:
+        publish.return_value = (
+            "registry.elfeel.me/apps/example-app/web@sha256:" + "a" * 64
+        )
+        image = f"registry.elfeel.me/apps/example-app/web:{SOURCE_SHA}"
+        value = publish_local_image(image, "registry.elfeel.me", "Publishing web")
+        self.assertEqual(value, publish.return_value)
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[:4], ["skopeo", "copy", "--format", "oci"]
+        )
+        self.assertEqual(command[4], f"docker-daemon:{image}")
+        self.assertRegex(command[5], r"^oci:.+:release$")
+        layout = publish.call_args.args[0]
+        self.assertEqual(command[5], f"oci:{layout}:release")
+        publish.assert_called_once_with(layout, image, "registry.elfeel.me")
+
+    @mock.patch("publish_images.publish_local_image")
     @mock.patch("publish_images.subprocess.run")
     def test_build_argument_value_is_not_logged_by_gateway(
         self,
         run: mock.Mock,
-        _login: mock.Mock,
-        digest: mock.Mock,
+        publish: mock.Mock,
     ) -> None:
-        digest.return_value = (
+        publish.return_value = (
             "registry.elfeel.me/apps/example-app/web@sha256:" + "a" * 64
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -99,6 +118,7 @@ class PublishImagesTests(unittest.TestCase):
         self.assertNotIn("do-not-echo-this-value", output.getvalue())
         build_command = run.call_args_list[0].args[0]
         self.assertIn("PUBLIC_VALUE=do-not-echo-this-value", build_command)
+        publish.assert_called_once()
 
 
 if __name__ == "__main__":
