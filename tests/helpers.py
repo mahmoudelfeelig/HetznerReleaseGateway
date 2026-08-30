@@ -70,6 +70,7 @@ def workflow_run(
     run_attempt: int = 1,
     status: str = "completed",
     conclusion: str = "success",
+    updated_at: str = "2026-08-30T00:10:00Z",
 ) -> dict[str, Any]:
     return {
         "name": name,
@@ -82,6 +83,7 @@ def workflow_run(
         "event": "push",
         "status": status,
         "conclusion": conclusion,
+        "updated_at": updated_at,
     }
 
 

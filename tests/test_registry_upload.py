@@ -28,6 +28,16 @@ HOST = "registry.example.test"
 REPOSITORY = "apps/example/web"
 TAG = "a" * 40
 IMAGE = f"{HOST}/{REPOSITORY}:{TAG}"
+PROVENANCE = {
+    "io.elfeel.release.provenance-version": "1",
+    "io.elfeel.release.plan-digest": "sha256:" + "b" * 64,
+    "io.elfeel.release.app": "example",
+    "io.elfeel.release.component": "web",
+    "io.elfeel.release.strategy": "source-build",
+    "io.elfeel.release.gateway-sha": "c" * 40,
+    "org.opencontainers.image.source": "https://github.com/owner/example",
+    "org.opencontainers.image.revision": TAG,
+}
 
 
 def _json_bytes(value: object) -> bytes:
@@ -912,6 +922,474 @@ class ChunkedUploadTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RegistryUploadError, "overwrite"):
             client.tag_state(manifest, b"{}")
+
+
+class ExistingComponentTests(unittest.TestCase):
+    def _client(self) -> registry_upload._RegistryClient:
+        reference = registry_upload._parse_image(IMAGE, HOST)
+        client = registry_upload._RegistryClient(reference, opener=_FakeOpener([]))
+        client._bearer_token = "registry.header.payload"
+        return client
+
+    def _manifest(self, annotations: dict[str, str] | None = None) -> tuple[str, bytes]:
+        value = {
+            "schemaVersion": 2,
+            "mediaType": registry_upload.OCI_MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": registry_upload.OCI_CONFIG_MEDIA_TYPE,
+                "digest": "sha256:" + "d" * 64,
+                "size": 128,
+            },
+            "layers": [],
+            "annotations": dict(PROVENANCE if annotations is None else annotations),
+        }
+        manifest_bytes = _json_bytes(value)
+        return _digest(manifest_bytes), manifest_bytes
+
+    def test_missing_component_tag_returns_none_without_a_get(self) -> None:
+        client = self._client()
+        with mock.patch.object(
+            client,
+            "_authorized_request",
+            return_value=_response(404),
+        ) as request:
+            self.assertIsNone(client.resolve_existing_manifest(PROVENANCE))
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_args.args[0], "HEAD")
+
+    def test_valid_component_manifest_returns_exact_digest_reference(self) -> None:
+        client = self._client()
+        digest, manifest_bytes = self._manifest()
+        common = {
+            "Docker_Content_Digest": digest,
+            "Content_Length": str(len(manifest_bytes)),
+            "Content_Type": registry_upload.OCI_MANIFEST_MEDIA_TYPE,
+        }
+        with mock.patch.object(
+            client,
+            "_authorized_request",
+            side_effect=[
+                _response(200, **common),
+                registry_upload._Response(
+                    status=200,
+                    headers=_headers(**common),
+                    body=manifest_bytes,
+                ),
+            ],
+        ):
+            reference = client.resolve_existing_manifest(PROVENANCE)
+        self.assertEqual(reference, f"{HOST}/{REPOSITORY}@{digest}")
+
+    def test_remote_provenance_mismatch_and_unknown_reserved_key_fail(self) -> None:
+        cases = {
+            "wrong plan": {
+                **PROVENANCE,
+                "io.elfeel.release.plan-digest": "sha256:" + "e" * 64,
+            },
+            "unknown reserved": {
+                **PROVENANCE,
+                "io.elfeel.release.unexpected": "value",
+            },
+            "missing field": {
+                key: value
+                for key, value in PROVENANCE.items()
+                if key != "io.elfeel.release.component"
+            },
+            "unicode mismatch": {
+                **PROVENANCE,
+                "io.elfeel.release.component": "w\u00e9b",
+            },
+        }
+        for name, annotations in cases.items():
+            digest, manifest_bytes = self._manifest(annotations)
+            common = {
+                "Docker_Content_Digest": digest,
+                "Content_Length": str(len(manifest_bytes)),
+                "Content_Type": registry_upload.OCI_MANIFEST_MEDIA_TYPE,
+            }
+            client = self._client()
+            with self.subTest(name=name), mock.patch.object(
+                client,
+                "_authorized_request",
+                side_effect=[
+                    _response(200, **common),
+                    registry_upload._Response(
+                        status=200,
+                        headers=_headers(**common),
+                        body=manifest_bytes,
+                    ),
+                ],
+            ):
+                with self.assertRaisesRegex(RegistryUploadError, "provenance"):
+                    client.resolve_existing_manifest(PROVENANCE)
+
+    def test_remote_manifest_digest_size_and_media_type_are_exact(self) -> None:
+        digest, manifest_bytes = self._manifest()
+        cases = {
+            "digest": {
+                "Docker_Content_Digest": "sha256:" + "f" * 64,
+                "Content_Length": str(len(manifest_bytes)),
+                "Content_Type": registry_upload.OCI_MANIFEST_MEDIA_TYPE,
+            },
+            "size": {
+                "Docker_Content_Digest": digest,
+                "Content_Length": str(len(manifest_bytes) + 1),
+                "Content_Type": registry_upload.OCI_MANIFEST_MEDIA_TYPE,
+            },
+            "media": {
+                "Docker_Content_Digest": digest,
+                "Content_Length": str(len(manifest_bytes)),
+                "Content_Type": "application/vnd.docker.distribution.manifest.v2+json",
+            },
+        }
+        for name, fetched_headers in cases.items():
+            head_headers = {
+                "Docker_Content_Digest": digest,
+                "Content_Length": str(len(manifest_bytes)),
+                "Content_Type": registry_upload.OCI_MANIFEST_MEDIA_TYPE,
+            }
+            if name == "media":
+                head_headers = fetched_headers
+            client = self._client()
+            responses = [_response(200, **head_headers)]
+            if name != "media":
+                responses.append(
+                    registry_upload._Response(
+                        status=200,
+                        headers=_headers(**fetched_headers),
+                        body=manifest_bytes,
+                    )
+                )
+            with self.subTest(name=name), mock.patch.object(
+                client,
+                "_authorized_request",
+                side_effect=responses,
+            ):
+                with self.assertRaises(RegistryUploadError):
+                    client.resolve_existing_manifest(PROVENANCE)
+
+    def test_remote_manifest_rejects_duplicate_json_and_docker_media_body(self) -> None:
+        docker_value = {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": registry_upload.OCI_CONFIG_MEDIA_TYPE,
+                "digest": "sha256:" + "d" * 64,
+                "size": 128,
+            },
+            "layers": [],
+            "annotations": PROVENANCE,
+        }
+        cases = (
+            b'{"schemaVersion":2,"schemaVersion":2}',
+            _json_bytes(docker_value),
+        )
+        for manifest_bytes in cases:
+            digest = _digest(manifest_bytes)
+            common = {
+                "Docker_Content_Digest": digest,
+                "Content_Length": str(len(manifest_bytes)),
+                "Content_Type": registry_upload.OCI_MANIFEST_MEDIA_TYPE,
+            }
+            client = self._client()
+            with self.subTest(body=manifest_bytes[:40]), mock.patch.object(
+                client,
+                "_authorized_request",
+                side_effect=[
+                    _response(200, **common),
+                    registry_upload._Response(
+                        status=200,
+                        headers=_headers(**common),
+                        body=manifest_bytes,
+                    ),
+                ],
+            ):
+                with self.assertRaises(RegistryUploadError):
+                    client.resolve_existing_manifest(PROVENANCE)
+
+    @mock.patch("registry_upload._RegistryClient")
+    def test_top_level_reuse_is_read_only_and_authenticated(
+        self,
+        client_type: mock.Mock,
+    ) -> None:
+        expected = f"{HOST}/{REPOSITORY}@sha256:" + "e" * 64
+        client = mock.Mock()
+        client.resolve_existing_manifest.return_value = expected
+        client_type.return_value = client
+        self.assertEqual(
+            registry_upload.resolve_existing_oci_image(IMAGE, HOST, PROVENANCE),
+            expected,
+        )
+        client.authenticate.assert_called_once_with()
+        client.resolve_existing_manifest.assert_called_once_with(PROVENANCE)
+
+    def test_top_level_reuse_rejects_scope_and_incomplete_provenance_before_io(self) -> None:
+        bad_image = f"{HOST}/releases/example:{TAG}"
+        with mock.patch("registry_upload._RegistryClient") as client_type:
+            with self.assertRaisesRegex(RegistryUploadError, "component reuse"):
+                registry_upload.resolve_existing_oci_image(
+                    bad_image,
+                    HOST,
+                    PROVENANCE,
+                )
+            incomplete = dict(PROVENANCE)
+            incomplete.pop("io.elfeel.release.plan-digest")
+            with self.assertRaisesRegex(RegistryUploadError, "incomplete"):
+                registry_upload.resolve_existing_oci_image(
+                    IMAGE,
+                    HOST,
+                    incomplete,
+                )
+            client_type.assert_not_called()
+
+
+class ReleasePromotionTests(unittest.TestCase):
+    def _client(
+        self,
+        *,
+        repository: str = "releases/example-app",
+        tag: str = "production",
+    ) -> registry_upload._RegistryClient:
+        image = f"{HOST}/{repository}:{tag}"
+        reference = registry_upload._parse_image(image, HOST)
+        client = registry_upload._RegistryClient(reference, opener=_FakeOpener([]))
+        client._bearer_token = "registry.header.payload"
+        return client
+
+    def _manifest(self) -> tuple[Descriptor, bytes]:
+        manifest_bytes = b'{"schemaVersion":2}'
+        return (
+            Descriptor(
+                media_type=registry_upload.OCI_MANIFEST_MEDIA_TYPE,
+                digest=_digest(manifest_bytes),
+                size=len(manifest_bytes),
+                path=Path("unused"),
+            ),
+            manifest_bytes,
+        )
+
+    def test_production_pointer_put_has_no_immutable_precondition(self) -> None:
+        client = self._client()
+        manifest, manifest_bytes = self._manifest()
+        created = _response(
+            201,
+            Location=(
+                f"/v2/{client.reference.repository}/manifests/{manifest.digest}"
+            ),
+            Docker_Content_Digest=manifest.digest,
+        )
+        with (
+            mock.patch.object(client, "_release_pointer_digest", return_value=None),
+            mock.patch.object(client, "_send", return_value=created) as send,
+            mock.patch.object(client, "_get_manifest") as get_manifest,
+        ):
+            client.put_release_pointer(manifest, manifest_bytes)
+        self.assertNotIn("If-None-Match", send.call_args.kwargs["headers"])
+        self.assertEqual(
+            send.call_args.kwargs["headers"]["Content-Type"],
+            registry_upload.OCI_MANIFEST_MEDIA_TYPE,
+        )
+        get_manifest.assert_called_once_with(
+            "production",
+            manifest.digest,
+            manifest_bytes,
+        )
+
+    def test_exact_existing_production_pointer_is_idempotent(self) -> None:
+        client = self._client()
+        manifest, manifest_bytes = self._manifest()
+        with (
+            mock.patch.object(
+                client,
+                "_release_pointer_digest",
+                return_value=manifest.digest,
+            ),
+            mock.patch.object(client, "_send") as send,
+            mock.patch.object(client, "_get_manifest") as get_manifest,
+        ):
+            client.put_release_pointer(manifest, manifest_bytes)
+        send.assert_not_called()
+        get_manifest.assert_called_once_with(
+            "production",
+            manifest.digest,
+            manifest_bytes,
+        )
+
+    def test_ambiguous_put_accepts_only_the_exact_target_bytes(self) -> None:
+        client = self._client()
+        manifest, manifest_bytes = self._manifest()
+        old_digest = "sha256:" + "1" * 64
+        with (
+            mock.patch.object(
+                client,
+                "_release_pointer_digest",
+                side_effect=[old_digest, manifest.digest],
+            ),
+            mock.patch.object(
+                client,
+                "_send",
+                side_effect=registry_upload._TransportError("simulated EOF"),
+            ) as send,
+            mock.patch.object(client, "_get_manifest") as get_manifest,
+        ):
+            client.put_release_pointer(manifest, manifest_bytes)
+        self.assertEqual(send.call_count, 1)
+        get_manifest.assert_called_once_with(
+            "production",
+            manifest.digest,
+            manifest_bytes,
+        )
+
+    def test_ambiguous_put_never_overwrites_a_third_digest(self) -> None:
+        client = self._client()
+        manifest, manifest_bytes = self._manifest()
+        old_digest = "sha256:" + "1" * 64
+        third_digest = "sha256:" + "2" * 64
+        with (
+            mock.patch.object(
+                client,
+                "_release_pointer_digest",
+                side_effect=[old_digest, third_digest],
+            ),
+            mock.patch.object(
+                client,
+                "_send",
+                side_effect=registry_upload._TransportError("simulated EOF"),
+            ) as send,
+            mock.patch.object(client, "_get_manifest") as get_manifest,
+        ):
+            with self.assertRaisesRegex(RegistryUploadError, "changed concurrently"):
+                client.put_release_pointer(manifest, manifest_bytes)
+        self.assertEqual(send.call_count, 1)
+        get_manifest.assert_not_called()
+
+    def test_unchanged_baseline_allows_one_bounded_retry(self) -> None:
+        client = self._client()
+        manifest, manifest_bytes = self._manifest()
+        old_digest = "sha256:" + "1" * 64
+        created = _response(
+            201,
+            Location=(
+                f"/v2/{client.reference.repository}/manifests/{manifest.digest}"
+            ),
+            Docker_Content_Digest=manifest.digest,
+        )
+        with (
+            mock.patch.object(
+                client,
+                "_release_pointer_digest",
+                side_effect=[old_digest, old_digest, old_digest],
+            ),
+            mock.patch.object(
+                client,
+                "_send",
+                side_effect=[registry_upload._TransportError("simulated EOF"), created],
+            ) as send,
+            mock.patch.object(client, "_get_manifest"),
+            mock.patch("registry_upload._retry_delay"),
+        ):
+            client.put_release_pointer(manifest, manifest_bytes)
+        self.assertEqual(send.call_count, 2)
+
+    def test_conflicts_and_denials_fail_without_retry(self) -> None:
+        manifest, manifest_bytes = self._manifest()
+        for status in (403, 409, 412):
+            client = self._client()
+            with (
+                self.subTest(status=status),
+                mock.patch.object(
+                    client,
+                    "_release_pointer_digest",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    client,
+                    "_send",
+                    return_value=_response(status),
+                ) as send,
+            ):
+                with self.assertRaisesRegex(RegistryUploadError, "rejected"):
+                    client.put_release_pointer(manifest, manifest_bytes)
+                self.assertEqual(send.call_count, 1)
+
+    def test_mutable_put_is_restricted_to_release_production_tag(self) -> None:
+        manifest, manifest_bytes = self._manifest()
+        for client in (
+            self._client(repository="apps/example-app/web"),
+            self._client(tag="latest"),
+            self._client(tag="a" * 40),
+        ):
+            with self.subTest(reference=client.reference.tag):
+                client._send = mock.Mock()
+                with self.assertRaisesRegex(RegistryUploadError, "restricted"):
+                    client.put_release_pointer(manifest, manifest_bytes)
+                client._send.assert_not_called()
+
+    @mock.patch("registry_upload._RegistryClient")
+    @mock.patch("registry_upload.load_oci_layout")
+    def test_promotion_verifies_source_before_constructing_production(
+        self,
+        load: mock.Mock,
+        client_type: mock.Mock,
+    ) -> None:
+        manifest, manifest_bytes = self._manifest()
+        loaded = mock.Mock(manifest=manifest, manifest_bytes=manifest_bytes)
+        load.return_value = loaded
+        immutable_client = mock.Mock()
+        immutable_client.tag_state.return_value = True
+        production_client = mock.Mock()
+        client_type.side_effect = [immutable_client, production_client]
+        image = f"{HOST}/releases/example-app:{'a' * 40}"
+
+        reference = registry_upload.promote_release_marker(Path("layout"), image, HOST)
+
+        self.assertEqual(
+            reference,
+            f"{HOST}/releases/example-app@{manifest.digest}",
+        )
+        immutable_client.authenticate.assert_called_once_with()
+        immutable_client.tag_state.assert_called_once_with(manifest, manifest_bytes)
+        production_client.authenticate.assert_called_once_with()
+        production_client.put_release_pointer.assert_called_once_with(
+            manifest,
+            manifest_bytes,
+        )
+        production_reference = client_type.call_args_list[1].args[0]
+        self.assertEqual(production_reference.repository, "releases/example-app")
+        self.assertEqual(production_reference.tag, "production")
+
+    @mock.patch("registry_upload._RegistryClient")
+    @mock.patch("registry_upload.load_oci_layout")
+    def test_missing_immutable_marker_cannot_be_promoted(
+        self,
+        load: mock.Mock,
+        client_type: mock.Mock,
+    ) -> None:
+        manifest, manifest_bytes = self._manifest()
+        load.return_value = mock.Mock(
+            manifest=manifest,
+            manifest_bytes=manifest_bytes,
+        )
+        immutable_client = mock.Mock()
+        immutable_client.tag_state.return_value = False
+        client_type.return_value = immutable_client
+        image = f"{HOST}/releases/example-app:{'a' * 40}"
+        with self.assertRaisesRegex(RegistryUploadError, "not present"):
+            registry_upload.promote_release_marker(Path("layout"), image, HOST)
+        self.assertEqual(client_type.call_count, 1)
+
+    def test_promotion_rejects_wrong_repository_or_tag_before_io(self) -> None:
+        for image in (
+            f"{HOST}/apps/example-app/web:{'a' * 40}",
+            f"{HOST}/releases/example-app:production",
+            f"{HOST}/releases/example-app:{'A' * 40}",
+        ):
+            with self.subTest(image=image), mock.patch(
+                "registry_upload.load_oci_layout"
+            ) as load:
+                with self.assertRaises(RegistryUploadError):
+                    registry_upload.promote_release_marker(Path("layout"), image, HOST)
+                load.assert_not_called()
 
 
 class InputValidationTests(unittest.TestCase):

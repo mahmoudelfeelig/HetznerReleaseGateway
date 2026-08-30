@@ -6,6 +6,10 @@ GitHub Actions run and every workflow required by that commit's release manifest
 immutable component images and a schema-v2 release marker using a short-lived GitHub OIDC identity.
 Component images are normalized into a local OCI layout, then uploaded through the registry's
 resumable API in bounded chunks so an interrupted request resumes without restarting a large layer.
+Each component manifest carries gateway-owned provenance that binds the canonical release plan,
+source, component, strategy, and exact gateway commit. A retry may reuse an existing source-SHA tag
+only after a read-only HEAD/GET verifies that complete provenance and the manifest digest; legacy or
+mismatched tags fail closed and are never overwritten.
 
 The gateway does not contain an application inventory or any runtime orchestration policy. The
 private controller independently decides whether a marker is authorized and how its named image
@@ -89,7 +93,17 @@ The marker has schema version 2. It records the application and source identitie
 repository, workflow path and commit, required CI run evidence, and a mapping from component names to
 immutable OCI references. Artifact releases also record the exact run attempt, artifact ID, name,
 digest, size, and expected payload paths; source builds record a null artifact. The marker contains
-no runtime service mapping.
+no runtime service mapping. Its timestamp comes from immutable completed-CI evidence, and the gateway
+constructs the OCI config, manifest, and `/release.json` layer deterministically rather than relying
+on Docker's legacy manifest format. The source-SHA marker remains create-only. After one final release
+plan comparison, the in-memory OIDC registry client may update only the same release repository's
+literal `production` tag and verifies the resulting digest, media type, length, hash, and bytes.
+
+The per-application workflow concurrency group remains active through receipt completion. This is a
+required serialization boundary for the mutable production pointer: the Registry V2 manifest PUT has
+no compare-and-swap primitive. If a transient write has an ambiguous outcome, the gateway accepts the
+exact target, retries only while the previously observed pointer is unchanged, and fails if it sees a
+third digest.
 
 The gateway waits for a signed schema-v2 terminal receipt. A receipt has exactly eight fields:
 version, application, source SHA, release reference, terminal status, completion time, rollback

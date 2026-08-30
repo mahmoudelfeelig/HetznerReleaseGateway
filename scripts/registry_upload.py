@@ -51,6 +51,27 @@ _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _UPLOAD_IDENTIFIER = re.compile(r"[A-Za-z0-9._~=-]+\Z")
 _UPLOAD_RANGE = re.compile(r"(?:bytes=)?0-([0-9]+)\Z")
 _TOKEN_VALUE = re.compile(r"[^\x00-\x20\x7f]+\Z")
+_SOURCE_SHA_TAG = re.compile(r"[0-9a-f]{40}\Z")
+_RELEASE_REPOSITORY = re.compile(
+    r"releases/[a-z0-9]+(?:[._-][a-z0-9]+)*\Z"
+)
+_COMPONENT_REPOSITORY = re.compile(
+    r"apps/[a-z0-9]+(?:[._-][a-z0-9]+)*/"
+    r"[a-z0-9]+(?:[._-][a-z0-9]+)*\Z"
+)
+_PROVENANCE_PREFIX = "io.elfeel.release."
+_PROVENANCE_KEYS = frozenset(
+    {
+        "io.elfeel.release.provenance-version",
+        "io.elfeel.release.plan-digest",
+        "io.elfeel.release.app",
+        "io.elfeel.release.component",
+        "io.elfeel.release.strategy",
+        "io.elfeel.release.gateway-sha",
+        "org.opencontainers.image.source",
+        "org.opencontainers.image.revision",
+    }
+)
 
 _RETRYABLE_STATUS = frozenset({416, 502, 503, 504})
 
@@ -287,6 +308,124 @@ def _validate_descriptor(
         path=path,
         platform=platform,
     )
+
+
+def _validate_remote_descriptor(
+    value: Any,
+    description: str,
+    allowed_media_types: Iterable[str],
+) -> Descriptor:
+    if not isinstance(value, dict):
+        raise RegistryUploadError(f"{description} must be an OCI descriptor object")
+    allowed_keys = {"mediaType", "digest", "size", "annotations", "platform"}
+    if not set(value).issubset(allowed_keys):
+        raise RegistryUploadError(f"{description} contains unsupported descriptor members")
+    media_type = value.get("mediaType")
+    if not isinstance(media_type, str) or media_type not in set(allowed_media_types):
+        raise RegistryUploadError(f"{description} has an unsupported media type")
+    digest = value.get("digest")
+    if not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None:
+        raise RegistryUploadError(f"{description} must use a lowercase sha256 digest")
+    size = value.get("size")
+    if isinstance(size, bool) or not isinstance(size, int) or not 0 <= size <= MAX_BLOB_SIZE:
+        raise RegistryUploadError(f"{description} has an invalid size")
+    _validate_annotations(value.get("annotations"), description)
+    platform = _validate_platform(value.get("platform"), description)
+    return Descriptor(
+        media_type=media_type,
+        digest=digest,
+        size=size,
+        path=Path("remote-oci-blob"),
+        platform=platform,
+    )
+
+
+def _validate_provenance_expectations(value: Mapping[str, str]) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) != _PROVENANCE_KEYS:
+        raise RegistryUploadError("component provenance has an incomplete field set")
+    result = dict(value)
+    if any(
+        not isinstance(key, str)
+        or not isinstance(item, str)
+        or not item
+        or len(key) > 1024
+        or len(item) > 4096
+        or any(ord(character) < 0x20 for character in key + item)
+        for key, item in result.items()
+    ):
+        raise RegistryUploadError("component provenance contains an invalid annotation")
+    if result["io.elfeel.release.provenance-version"] != "1":
+        raise RegistryUploadError("component provenance version is unsupported")
+    if _DIGEST.fullmatch(result["io.elfeel.release.plan-digest"]) is None:
+        raise RegistryUploadError("component provenance plan digest is invalid")
+    if _SOURCE_SHA_TAG.fullmatch(result["io.elfeel.release.gateway-sha"]) is None:
+        raise RegistryUploadError("component provenance gateway SHA is invalid")
+    if _SOURCE_SHA_TAG.fullmatch(result["org.opencontainers.image.revision"]) is None:
+        raise RegistryUploadError("component provenance source revision is invalid")
+    if result["io.elfeel.release.strategy"] not in {
+        "source-build",
+        "artifact-images",
+    }:
+        raise RegistryUploadError("component provenance strategy is invalid")
+    return result
+
+
+def _validate_remote_manifest(
+    manifest_bytes: bytes,
+    expected_annotations: Mapping[str, str],
+) -> None:
+    manifest = _decode_json(manifest_bytes, "remote image manifest")
+    if not isinstance(manifest, dict):
+        raise RegistryUploadError("remote image manifest must be an object")
+    if not set(manifest).issubset(
+        {"schemaVersion", "mediaType", "config", "layers", "annotations"}
+    ):
+        raise RegistryUploadError("remote image manifest contains unsupported members")
+    if (
+        manifest.get("schemaVersion") != 2
+        or manifest.get("mediaType") != OCI_MANIFEST_MEDIA_TYPE
+    ):
+        raise RegistryUploadError("remote image is not a plain OCI image manifest")
+    annotations = manifest.get("annotations")
+    _validate_annotations(annotations, "remote image manifest")
+    if not isinstance(annotations, dict):
+        raise RegistryUploadError("remote image manifest has no provenance annotations")
+    reserved = {key for key in annotations if key.startswith(_PROVENANCE_PREFIX)}
+    expected_reserved = {
+        key for key in expected_annotations if key.startswith(_PROVENANCE_PREFIX)
+    }
+    if reserved != expected_reserved:
+        raise RegistryUploadError("remote image has an unexpected provenance field set")
+    for key, expected in expected_annotations.items():
+        actual = annotations.get(key)
+        if not isinstance(actual, str) or not hmac.compare_digest(
+            actual.encode("utf-8"), expected.encode("utf-8")
+        ):
+            raise RegistryUploadError(f"remote image provenance mismatch for {key}")
+
+    config = _validate_remote_descriptor(
+        manifest.get("config"),
+        "remote image config",
+        {OCI_CONFIG_MEDIA_TYPE},
+    )
+    if config.platform is not None or config.size > MAX_METADATA_FILE:
+        raise RegistryUploadError("remote image config descriptor is invalid")
+    layer_values = manifest.get("layers")
+    if not isinstance(layer_values, list) or not 0 <= len(layer_values) <= MAX_LAYERS:
+        raise RegistryUploadError("remote image manifest has an invalid layer list")
+    layers = [
+        _validate_remote_descriptor(
+            item,
+            f"remote image layer {index}",
+            OCI_LAYER_MEDIA_TYPES,
+        )
+        for index, item in enumerate(layer_values)
+    ]
+    if any(layer.platform is not None for layer in layers):
+        raise RegistryUploadError("remote image layer descriptor declares a platform")
+    digests = [layer.digest for layer in layers]
+    if len(digests) != len(set(digests)):
+        raise RegistryUploadError("remote image manifest contains duplicate layers")
 
 
 def load_oci_layout(layout: Path) -> OCILayout:
@@ -551,6 +690,16 @@ def _content_length(headers: Message, expected: int, description: str) -> None:
     value = _single_header(headers, "Content-Length", f"{description} Content-Length")
     if not value.isascii() or not value.isdigit() or int(value) != expected:
         raise RegistryUploadError(f"registry returned an unexpected {description} size")
+
+
+def _bounded_content_length(headers: Message, maximum: int, description: str) -> int:
+    value = _single_header(headers, "Content-Length", f"{description} Content-Length")
+    if not value.isascii() or not value.isdigit():
+        raise RegistryUploadError(f"registry returned an invalid {description} size")
+    size = int(value)
+    if not 0 <= size <= maximum:
+        raise RegistryUploadError(f"registry returned an excessive {description} size")
+    return size
 
 
 def _digest_header(headers: Message, expected: str, description: str) -> None:
@@ -1149,21 +1298,95 @@ class _RegistryClient:
         ):
             raise RegistryUploadError("registry returned different manifest bytes")
 
-    def tag_state(self, manifest: Descriptor, manifest_bytes: bytes) -> bool:
-        response = self._authorized_request(
+    def resolve_existing_manifest(
+        self,
+        expected_annotations: Mapping[str, str],
+    ) -> str | None:
+        headers = {"Accept": OCI_MANIFEST_MEDIA_TYPE}
+        head = self._authorized_request(
             "HEAD",
             self._manifest_url(self.reference.tag),
+            headers=headers,
+        )
+        if head.status == 404:
+            return None
+        if head.status != 200:
+            raise RegistryUploadError("registry component-tag preflight failed")
+        digest = _single_header(
+            head.headers,
+            "Docker-Content-Digest",
+            "Docker-Content-Digest",
+        )
+        if _DIGEST.fullmatch(digest) is None:
+            raise RegistryUploadError("registry returned an invalid component digest")
+        _content_type(head.headers, OCI_MANIFEST_MEDIA_TYPE, "component manifest")
+        size = _bounded_content_length(
+            head.headers,
+            MAX_METADATA_FILE,
+            "component manifest",
+        )
+
+        fetched = self._authorized_request(
+            "GET",
+            self._manifest_url(self.reference.tag),
+            headers=headers,
+        )
+        if fetched.status != 200:
+            raise RegistryUploadError("registry component manifest GET failed")
+        _digest_header(fetched.headers, digest, "component manifest")
+        _content_type(fetched.headers, OCI_MANIFEST_MEDIA_TYPE, "component manifest")
+        _content_length(fetched.headers, size, "component manifest")
+        if len(fetched.body) != size:
+            raise RegistryUploadError("registry returned truncated component manifest bytes")
+        actual_digest = f"sha256:{hashlib.sha256(fetched.body).hexdigest()}"
+        if not hmac.compare_digest(actual_digest, digest):
+            raise RegistryUploadError("registry returned corrupt component manifest bytes")
+        _validate_remote_manifest(fetched.body, expected_annotations)
+        return self.reference.digested(digest)
+
+    def _tag_digest(self, reference: str, description: str) -> str | None:
+        response = self._authorized_request(
+            "HEAD",
+            self._manifest_url(reference),
             headers={"Accept": OCI_MANIFEST_MEDIA_TYPE},
         )
         if response.status == 404:
-            return False
+            return None
         if response.status != 200:
-            raise RegistryUploadError("registry immutable-tag preflight failed")
-        digest = _single_header(response.headers, "Docker-Content-Digest", "Docker-Content-Digest")
-        if _DIGEST.fullmatch(digest) is None or not hmac.compare_digest(digest, manifest.digest):
+            raise RegistryUploadError(f"registry {description} preflight failed")
+        digest = _single_header(
+            response.headers,
+            "Docker-Content-Digest",
+            "Docker-Content-Digest",
+        )
+        if _DIGEST.fullmatch(digest) is None:
+            raise RegistryUploadError("registry returned an invalid manifest digest")
+        return digest
+
+    def tag_state(self, manifest: Descriptor, manifest_bytes: bytes) -> bool:
+        digest = self._tag_digest(self.reference.tag, "immutable-tag")
+        if digest is None:
+            return False
+        if not hmac.compare_digest(digest, manifest.digest):
             raise RegistryUploadError("refusing to overwrite an existing immutable tag")
         self._get_manifest(self.reference.tag, manifest.digest, manifest_bytes)
         return True
+
+    def _validate_manifest_location(
+        self,
+        response: _Response,
+        manifest: Descriptor,
+    ) -> None:
+        _digest_header(response.headers, manifest.digest, "manifest")
+        value = _single_header(response.headers, "Location", "manifest Location")
+        location = _same_origin_url(self.base_url, value, "manifest Location")
+        parsed = urllib.parse.urlsplit(location)
+        permitted = {
+            f"/v2/{self.reference.repository}/manifests/{self.reference.tag}",
+            f"/v2/{self.reference.repository}/manifests/{manifest.digest}",
+        }
+        if parsed.path not in permitted or parsed.query:
+            raise RegistryUploadError("registry returned the wrong manifest Location")
 
     def put_manifest(self, manifest: Descriptor, manifest_bytes: bytes) -> None:
         url = self._manifest_url(self.reference.tag)
@@ -1183,16 +1406,7 @@ class _RegistryClient:
             except _TransportError:
                 response = None
             if response is not None and response.status == 201:
-                _digest_header(response.headers, manifest.digest, "manifest")
-                value = _single_header(response.headers, "Location", "manifest Location")
-                location = _same_origin_url(self.base_url, value, "manifest Location")
-                parsed = urllib.parse.urlsplit(location)
-                permitted = {
-                    f"/v2/{self.reference.repository}/manifests/{self.reference.tag}",
-                    f"/v2/{self.reference.repository}/manifests/{manifest.digest}",
-                }
-                if parsed.path not in permitted or parsed.query:
-                    raise RegistryUploadError("registry returned the wrong manifest Location")
+                self._validate_manifest_location(response, manifest)
                 self._get_manifest(self.reference.tag, manifest.digest, manifest_bytes)
                 return
             if response is not None and response.status == 401:
@@ -1211,6 +1425,93 @@ class _RegistryClient:
             if attempt + 1 < MAX_ATTEMPTS:
                 _retry_delay(attempt)
         raise RegistryUploadError("registry manifest publication retries were exhausted")
+
+    def _release_pointer_digest(self) -> str | None:
+        if (
+            self.reference.tag != "production"
+            or _RELEASE_REPOSITORY.fullmatch(self.reference.repository) is None
+        ):
+            raise RegistryUploadError(
+                "mutable publication is restricted to a production release pointer"
+            )
+        return self._tag_digest(self.reference.tag, "production-tag")
+
+    def put_release_pointer(
+        self,
+        manifest: Descriptor,
+        manifest_bytes: bytes,
+    ) -> None:
+        """Update only the mutable production pointer and verify exact bytes."""
+
+        baseline = self._release_pointer_digest()
+        if baseline is not None and hmac.compare_digest(baseline, manifest.digest):
+            self._get_manifest(self.reference.tag, manifest.digest, manifest_bytes)
+            return
+        url = self._manifest_url(self.reference.tag)
+        for attempt in range(MAX_ATTEMPTS):
+            if attempt:
+                current = self._release_pointer_digest()
+                if current is not None and hmac.compare_digest(
+                    current, manifest.digest
+                ):
+                    self._get_manifest(
+                        self.reference.tag,
+                        manifest.digest,
+                        manifest_bytes,
+                    )
+                    return
+                if (current is None) != (baseline is None) or (
+                    current is not None
+                    and baseline is not None
+                    and not hmac.compare_digest(current, baseline)
+                ):
+                    raise RegistryUploadError(
+                        "production release pointer changed concurrently"
+                    )
+            try:
+                response = self._send(
+                    "PUT",
+                    url,
+                    headers={
+                        **self._authorization(),
+                        "Content-Type": OCI_MANIFEST_MEDIA_TYPE,
+                        "Accept": OCI_MANIFEST_MEDIA_TYPE,
+                    },
+                    body=manifest_bytes,
+                )
+            except _TransportError:
+                response = None
+            if response is not None and response.status == 201:
+                self._validate_manifest_location(response, manifest)
+                self._get_manifest(self.reference.tag, manifest.digest, manifest_bytes)
+                return
+            if response is not None and response.status == 401:
+                self.authenticate()
+            elif response is not None and response.status not in {
+                502,
+                503,
+                504,
+            }:
+                raise RegistryUploadError("registry rejected the production release pointer")
+            current = self._release_pointer_digest()
+            if current is not None and hmac.compare_digest(current, manifest.digest):
+                self._get_manifest(
+                    self.reference.tag,
+                    manifest.digest,
+                    manifest_bytes,
+                )
+                return
+            if (current is None) != (baseline is None) or (
+                current is not None
+                and baseline is not None
+                and not hmac.compare_digest(current, baseline)
+            ):
+                raise RegistryUploadError(
+                    "production release pointer changed concurrently"
+                )
+            if attempt + 1 < MAX_ATTEMPTS:
+                _retry_delay(attempt)
+        raise RegistryUploadError("registry production-pointer retries were exhausted")
 
 
 def publish_oci_layout(layout: Path, image: str, registry_host: str) -> str:
@@ -1234,11 +1535,76 @@ def publish_oci_layout(layout: Path, image: str, registry_host: str) -> str:
     return reference.digested(loaded.manifest.digest)
 
 
+def resolve_existing_oci_image(
+    image: str,
+    registry_host: str,
+    expected_annotations: Mapping[str, str],
+) -> str | None:
+    """Return a verified immutable component reference, or None when absent."""
+
+    reference = _parse_image(image, registry_host)
+    if (
+        _SOURCE_SHA_TAG.fullmatch(reference.tag) is None
+        or _COMPONENT_REPOSITORY.fullmatch(reference.repository) is None
+    ):
+        raise RegistryUploadError(
+            "component reuse requires an apps/<app>/<component> source-SHA tag"
+        )
+    provenance = _validate_provenance_expectations(expected_annotations)
+    _, application, component = reference.repository.split("/")
+    if (
+        provenance["io.elfeel.release.app"] != application
+        or provenance["io.elfeel.release.component"] != component
+        or provenance["org.opencontainers.image.revision"] != reference.tag
+    ):
+        raise RegistryUploadError(
+            "component provenance does not match its immutable image reference"
+        )
+    client = _RegistryClient(reference)
+    client.authenticate()
+    return client.resolve_existing_manifest(provenance)
+
+
+def promote_release_marker(layout: Path, image: str, registry_host: str) -> str:
+    """Promote an immutable OCI marker to its repository's production tag.
+
+    This deliberately cannot update arbitrary tags or repositories. The exact
+    source-SHA marker must already exist and match the locally validated OCI
+    layout before the mutable pointer is written.
+    """
+
+    immutable = _parse_image(image, registry_host)
+    if (
+        _SOURCE_SHA_TAG.fullmatch(immutable.tag) is None
+        or _RELEASE_REPOSITORY.fullmatch(immutable.repository) is None
+    ):
+        raise RegistryUploadError(
+            "release promotion requires a releases/<app> source-SHA tag"
+        )
+    loaded = load_oci_layout(Path(layout))
+    immutable_client = _RegistryClient(immutable)
+    immutable_client.authenticate()
+    if not immutable_client.tag_state(loaded.manifest, loaded.manifest_bytes):
+        raise RegistryUploadError("immutable release marker is not present")
+
+    production = _ImageReference(
+        host=immutable.host,
+        repository=immutable.repository,
+        tag="production",
+    )
+    production_client = _RegistryClient(production)
+    production_client.authenticate()
+    production_client.put_release_pointer(loaded.manifest, loaded.manifest_bytes)
+    return immutable.digested(loaded.manifest.digest)
+
+
 __all__ = [
     "CHUNK_SIZE",
     "Descriptor",
     "OCILayout",
     "RegistryUploadError",
     "load_oci_layout",
+    "promote_release_marker",
     "publish_oci_layout",
+    "resolve_existing_oci_image",
 ]

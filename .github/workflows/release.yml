@@ -103,12 +103,15 @@ jobs:
 
       - name: Publish immutable application images
         shell: bash
+        env:
+          GATEWAY_SHA: ${{ job.workflow_sha }}
         run: |
           set -euo pipefail
           python gateway/scripts/publish_images.py \
             --plan "$RUNNER_TEMP/release-plan.json" \
             --source-root source \
             --artifact-root "$RUNNER_TEMP/release-artifact" \
+            --gateway-sha "$GATEWAY_SHA" \
             --output "$RUNNER_TEMP/image-digests.json"
 
       - name: Revalidate release authority before marker creation
@@ -129,7 +132,7 @@ jobs:
             --plan-output "$RUNNER_TEMP/revalidated-plan.json"
           cmp "$RUNNER_TEMP/release-plan.json" "$RUNNER_TEMP/revalidated-plan.json"
 
-      - name: Create schema-v2 release marker
+      - name: Create deterministic schema-v2 OCI release marker
         shell: bash
         env:
           GATEWAY_REPOSITORY: ${{ job.workflow_repository }}
@@ -143,10 +146,31 @@ jobs:
             --gateway-repository "$GATEWAY_REPOSITORY" \
             --gateway-workflow-path "$GATEWAY_WORKFLOW_PATH" \
             --gateway-sha "$GATEWAY_SHA" \
-            --output-directory "$RUNNER_TEMP/release-marker"
+            --output-directory "$RUNNER_TEMP/release-marker-oci"
 
-      - name: Promote release marker
+      - name: Publish immutable OCI release marker
         id: marker
+        shell: bash
+        env:
+          REGISTRY_HOST: ${{ steps.plan.outputs.registry_host }}
+          RELEASE_REPOSITORY: ${{ steps.plan.outputs.release_repository }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          immutable="$REGISTRY_HOST/$RELEASE_REPOSITORY:$SOURCE_SHA"
+          python gateway/scripts/publish_release_marker.py publish \
+            --image "$immutable" \
+            --registry-host "$REGISTRY_HOST" \
+            --layout "$RUNNER_TEMP/release-marker-oci" \
+            --reference-output "$RUNNER_TEMP/release-marker-reference.txt"
+          digest="$(cat "$RUNNER_TEMP/release-marker-reference.txt")"
+          case "$digest" in
+            "$REGISTRY_HOST/$RELEASE_REPOSITORY@sha256:"*) ;;
+            *) echo "Registry returned an invalid release digest" >&2; exit 1 ;;
+          esac
+          echo "release_reference=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Revalidate and promote verified OCI release marker
         shell: bash
         env:
           APP_INPUT: ${{ inputs.app }}
@@ -157,27 +181,6 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          oidc_token="$(python gateway/scripts/request_oidc.py --audience "https://$REGISTRY_HOST")"
-          echo "::add-mask::$oidc_token"
-          printf '%s' "$oidc_token" | docker login "$REGISTRY_HOST" \
-            --username github-actions --password-stdin
-          label="$(cat "$RUNNER_TEMP/release-marker/label.txt")"
-          immutable="$REGISTRY_HOST/$RELEASE_REPOSITORY:$SOURCE_SHA"
-          production="$REGISTRY_HOST/$RELEASE_REPOSITORY:production"
-          docker build \
-            --label "org.elfeel.release=$label" \
-            --label "org.opencontainers.image.revision=$SOURCE_SHA" \
-            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
-            --tag "$immutable" \
-            "$RUNNER_TEMP/release-marker"
-          docker push "$immutable"
-          docker pull "$immutable"
-          digest="$(docker image inspect "$immutable" --format '{{json .RepoDigests}}' | \
-            python -c 'import json,sys; p=sys.argv[1]+"@sha256:"; v=[x for x in json.load(sys.stdin) if x.startswith(p)]; print(v[0]) if len(v)==1 else sys.exit(1)' "$REGISTRY_HOST/$RELEASE_REPOSITORY")"
-          case "$digest" in
-            "$REGISTRY_HOST/$RELEASE_REPOSITORY@sha256:"*) ;;
-            *) echo "Registry returned an invalid release digest" >&2; exit 1 ;;
-          esac
           python gateway/scripts/release_plan.py \
             --app "$APP_INPUT" \
             --source-root source \
@@ -186,9 +189,11 @@ jobs:
             --run-id "$CI_RUN_ID_INPUT" \
             --plan-output "$RUNNER_TEMP/final-release-plan.json"
           cmp "$RUNNER_TEMP/release-plan.json" "$RUNNER_TEMP/final-release-plan.json"
-          docker tag "$immutable" "$production"
-          docker push "$production"
-          echo "release_reference=$digest" >> "$GITHUB_OUTPUT"
+          immutable="$REGISTRY_HOST/$RELEASE_REPOSITORY:$SOURCE_SHA"
+          python gateway/scripts/publish_release_marker.py promote \
+            --image "$immutable" \
+            --registry-host "$REGISTRY_HOST" \
+            --layout "$RUNNER_TEMP/release-marker-oci"
 
       - name: Wait for signed minimal production receipt
         shell: bash
@@ -204,13 +209,3 @@ jobs:
             --release-reference "$RELEASE_REFERENCE" \
             --public-key gateway/trust/deployment-receipt.pub \
             --timeout-seconds 1800
-
-      - name: Remove registry credentials
-        if: always()
-        shell: bash
-        env:
-          REGISTRY_HOST: ${{ steps.plan.outputs.registry_host }}
-        run: |
-          if [ -n "$REGISTRY_HOST" ]; then
-            docker logout "$REGISTRY_HOST" || true
-          fi

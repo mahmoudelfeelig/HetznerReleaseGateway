@@ -111,6 +111,18 @@ class ReleasePlanTests(unittest.TestCase):
         self.assertNotIn("service", component)
         self.assertNotIn("additional_services", component)
         self.assertNotIn("dockerfile_origin", component)
+        self.assertEqual(plan["published_at"], run["updated_at"])
+
+    def test_release_timestamp_is_stable_immutable_ci_evidence(self) -> None:
+        run = workflow_run(updated_at="2026-08-30T00:10:00.000Z")
+        first = build_plan(source_manifest(), SOURCE_SHA, {"CI": run})
+        second = build_plan(source_manifest(), SOURCE_SHA, {"CI": dict(run)})
+        self.assertEqual(first, second)
+        self.assertEqual(first["published_at"], "2026-08-30T00:10:00Z")
+
+        run["updated_at"] = "not-a-github-timestamp"
+        with self.assertRaisesRegex(RuntimeError, "completion timestamp is invalid"):
+            build_plan(source_manifest(), SOURCE_SHA, {"CI": run})
 
     def test_artifact_plan_uses_successful_ci_run(self) -> None:
         run = workflow_run(run_attempt=3)
